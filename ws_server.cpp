@@ -1,5 +1,9 @@
 #include <armadillo>
 
+#define BOOST_SPIRIT_THREADSAFE
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/json_parser.hpp>
+
 #include "compute/edflib.h"
 #include "compute/eeg_spectrogram.hpp"
 #include "compute/eeg_change_point.hpp"
@@ -10,6 +14,7 @@ using namespace arma;
 using namespace std;
 using namespace SimpleWeb;
 using namespace json11;
+using namespace boost::property_tree;
 
 #define NUM_THREADS 4
 #define PORT 8080
@@ -19,15 +24,15 @@ using namespace json11;
 const char* CH_NAME_MAP[] = {"LL", "LP", "RP", "RL"};
 
 void send_message(SocketServer<WS>* server, shared_ptr<SocketServer<WS>::Connection> connection,
-                  std::string msg_type, Json content, float* data, size_t data_size)
+                  string msg_type, ptree content, float* data, size_t data_size)
 {
 
-  Json msg = Json::object
-  {
-    {"type", msg_type},
-    {"content", content}
-  };
-  std::string header = msg.dump();
+  ptree msg;
+  msg.put("type", msg_type);
+  msg.add_child("content", content);
+  ostringstream header_stream;
+  write_json(header_stream, msg);
+  string header = header_stream.str();
 
   uint32_t header_len = header.size() + (8 - ((header.size() + 4) % 8));
   // append enough spaces so that the payload starts at an 8-byte
@@ -56,56 +61,52 @@ void send_message(SocketServer<WS>* server, shared_ptr<SocketServer<WS>::Connect
   }, BINARY_OPCODE);
 }
 
-void log_json(Json content) {
-  cout << "Sending content " << content.dump() << endl;
+void log_json(ptree content)
+{
+  ostringstream content_stream;
+  write_json(content_stream, content);
+  cout << "Sending content " << content_stream.str() << endl;
 }
 
 void send_frowvec(SocketServer<WS>* server,
                   shared_ptr<SocketServer<WS>::Connection> connection,
-                  std::string canvasId, std::string type,
-                  frowvec* vector)
+                  string canvasId, string type,
+                  float* vector, int n_elem)
 {
-
-  Json content = Json::object
-  {
-    {"action", "change_points"},
-    {"type", type},
-    {"canvasId", canvasId}
-  };
+  ptree content;
+  content.put("action", "change_points");
+  content.put("type", type);
+  content.put("canvasId", canvasId);
   log_json(content);
-  send_message(server, connection, "spectrogram", content, vector->memptr(), vector->n_elem);
+  size_t data_size = sizeof(float) * n_elem;
+  send_message(server, connection, "spectrogram", content, vector, data_size);
 }
 
 void send_spectrogram_new(SocketServer<WS>* server,
                           shared_ptr<SocketServer<WS>::Connection> connection,
-                          spec_params_t spec_params, std::string canvasId)
+                          spec_params_t spec_params, string canvasId)
 {
-  Json content = Json::object
-  {
-    {"action", "new"},
-    {"nblocks", spec_params.nblocks},
-    {"nfreqs", spec_params.nfreqs},
-    {"fs", spec_params.fs},
-    {"length", spec_params.spec_len},
-    {"canvasId", canvasId}
-  };
+  ptree content;
+  content.put("action", "new");
+  content.put("nblocks", spec_params.nblocks);
+  content.put("nfreqs", spec_params.nfreqs);
+  content.put("fs", spec_params.fs);
+  content.put("length", spec_params.spec_len);
+  content.put("canvasId", canvasId);
   log_json(content);
   send_message(server, connection, "spectrogram", content, NULL, -1);
 }
 
 void send_spectrogram_update(SocketServer<WS>* server,
                              shared_ptr<SocketServer<WS>::Connection> connection,
-                             spec_params_t spec_params, std::string canvasId,
+                             spec_params_t spec_params, string canvasId,
                              fmat& spec_mat)
 {
-
-  Json content = Json::object
-  {
-    {"action", "update"},
-    {"nblocks", spec_params.nblocks},
-    {"nfreqs", spec_params.nfreqs},
-    {"canvasId", canvasId}
-  };
+  ptree content;
+  content.put("action", "update");
+  content.put("nblocks", spec_params.nblocks);
+  content.put("nfreqs", spec_params.nfreqs);
+  content.put("canvasId", canvasId);
   size_t data_size = sizeof(float) * spec_mat.n_elem;
   float* spec_arr = (float*) malloc(data_size);
   serialize_spec_mat(&spec_params, spec_mat, spec_arr);
@@ -116,17 +117,17 @@ void send_spectrogram_update(SocketServer<WS>* server,
 
 void send_change_points(SocketServer<WS>* server,
                         shared_ptr<SocketServer<WS>::Connection> connection,
-                        std::string canvasId,
+                        string canvasId,
                         cp_data_t* cp_data)
 {
-  send_frowvec(server, connection, canvasId, "change_points", cp_data->cp);
-  send_frowvec(server, connection, canvasId, "summed_signal", cp_data->m);
+  send_frowvec(server, connection, canvasId, "change_points", cp_data->cp.memptr(), cp_data->cp.n_elem);
+  send_frowvec(server, connection, canvasId, "summed_signal", cp_data->m.memptr(), cp_data->cp.n_elem);
 }
 
-void on_file_spectrogram(SocketServer<WS>* server, shared_ptr<SocketServer<WS>::Connection> connection, Json data)
+void on_file_spectrogram(SocketServer<WS>* server, shared_ptr<SocketServer<WS>::Connection> connection, ptree data)
 {
-  std::string filename = data["filename"].string_value();
-  float duration = data["duration"].number_value();
+  string filename = data.get<string>("filename");
+  float duration = data.get<float>("duration");
 
   spec_params_t spec_params;
   char *filename_c = new char[filename.length() + 1];
@@ -142,28 +143,32 @@ void on_file_spectrogram(SocketServer<WS>* server, shared_ptr<SocketServer<WS>::
     eeg_spectrogram(&spec_params, ch, spec_mat);
 
     cp_data_t cp_data;
+    init_cp_data_t(&cp_data, spec_mat.n_rows);
     get_change_points(spec_mat, &cp_data);
 
     send_spectrogram_update(server, connection, spec_params, ch_name, spec_mat);
     send_change_points(server, connection, ch_name, &cp_data);
     this_thread::sleep_for(chrono::seconds(5)); // TODO(joshblum): fix this..
+    break;
   }
   close_edf(filename_c);
 }
 
-void receive_message(SocketServer<WS>* server, shared_ptr<SocketServer<WS>::Connection> connection, std::string type, Json content)
+void receive_message(SocketServer<WS>* server, shared_ptr<SocketServer<WS>::Connection> connection, string type, ptree content)
 {
+  ostringstream content_stream;
+  write_json(content_stream, content);
   if (type == "request_file_spectrogram")
   {
     on_file_spectrogram(server, connection, content);
   }
   else if (type == "information")
   {
-    cout << content.string_value() << endl;
+    cout << content_stream.str() << endl;
   }
   else
   {
-    cout << "Unknown type: " << type << " and content: " << content.string_value() << endl;
+    cout << "Unknown type: " << type << " and content: " << content_stream.str() << endl;
   }
 }
 
@@ -181,12 +186,12 @@ int main()
     //To receive message from client as string (data_ss.str())
     stringstream data_ss;
     message->data >> data_ss.rdbuf();
-    std::string data_s, err;
-    data_s = data_ss.str();
-    Json json = Json::parse(data_s, err);
+    ptree json;
+    read_json(data_ss, json);
     // TODO add error checking for null fields
-    std::string type = json["type"].string_value();
-    Json content = json["content"];
+    string type = json.get<string>("type");
+    //ptree content = json.get<ptree>("content");
+    ptree content;
 
     receive_message(&server, connection, type, content);
   };
